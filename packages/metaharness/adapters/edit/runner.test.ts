@@ -376,7 +376,7 @@ describe("writeConversationDump", () => {
 		};
 		sourceSession.appendMessage(userMessage);
 		await sourceSession.ensureOnDisk();
-		const artifactId = await sourceSession.saveArtifact("artifact contents", "read");
+		const artifactId = await sourceSession.saveArtifact("artifact contents");
 		await sourceSession.flush();
 		await sourceSession.close();
 
@@ -405,7 +405,8 @@ describe("writeConversationDump", () => {
 		const expectedBody = formatSessionDumpText({ messages: [userMessage] });
 		expect(dumpText.trim()).toBe(expectedBody.trim());
 
-		const copiedArtifactPath = path.join(dumpPath.slice(0, -3), path.basename(sourceArtifactPath));
+		// Spills are the session's `local://` files; the dump keeps them under `<dump>/local/`.
+		const copiedArtifactPath = path.join(dumpPath.slice(0, -3), "local", path.basename(sourceArtifactPath));
 		expect(await Bun.file(copiedArtifactPath).text()).toBe("artifact contents");
 	});
 });

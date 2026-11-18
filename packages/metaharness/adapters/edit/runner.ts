@@ -11,6 +11,7 @@ import { diffLines, EditStore, hashlineCountOps, hashlineFormatHeader } from "@o
 import type { AgentMessage, ResolvedThinkingLevel, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Model, ToolExample } from "@oh-my-pi/pi-ai";
 import { formatSessionDumpText, RpcClient } from "@oh-my-pi/pi-coding-agent";
+import { resolveLocalRoot } from "@oh-my-pi/pi-coding-agent/internal-urls/local-root";
 import { prompt } from "@oh-my-pi/pi-utils";
 import { formatDirectory } from "@oh-my-pi/typescript-edit-benchmark/formatter";
 import {
@@ -41,6 +42,7 @@ function formatLogPath(logFile: string): string {
 /** Subset of session state used for markdown conversation dumps (parity with /dump). */
 type ConversationDumpSessionState = {
 	sessionFile?: string;
+	sessionId?: string;
 	systemPrompt?: string[];
 	model?: Model;
 	thinkingLevel?: ThinkingLevel | undefined;
@@ -114,6 +116,8 @@ export interface BenchmarkConfig {
 type ConversationDumpSnapshot = {
 	messages: AgentMessage[];
 	sourceSessionFile?: string;
+	/** Session id of the source session; locates its `local://` root when that is shortened outside the artifacts dir. */
+	sourceSessionId?: string;
 	systemPrompt?: string[];
 	model?: Model;
 	thinkingLevel?: ThinkingLevel | undefined;
@@ -132,16 +136,39 @@ function dumpArtifactsDir(dumpFilePath: string): string {
 	return path.join(path.dirname(dumpFilePath), path.basename(dumpFilePath, ext));
 }
 
-async function copyConversationArtifacts(sourceSessionFile: string, targetDumpFile: string): Promise<void> {
-	const sourceArtifactsDir = dumpArtifactsDir(sourceSessionFile);
-	const targetArtifactsDir = dumpArtifactsDir(targetDumpFile);
+/** Copies `source` into `target` recursively; a missing source copies nothing. */
+async function copyDirectoryIfPresent(source: string, target: string): Promise<void> {
 	try {
-		const stat = await fs.promises.stat(sourceArtifactsDir);
+		const stat = await fs.promises.stat(source);
 		if (!stat.isDirectory()) return;
-		await fs.promises.cp(sourceArtifactsDir, targetArtifactsDir, { recursive: true });
+		await fs.promises.cp(source, target, { recursive: true });
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
 		throw error;
+	}
+}
+
+/**
+ * Copies the session's artifacts directory, which holds its spills (`local://N.log`) under `local/`.
+ * A long Windows path moves the `local://` root out of the artifacts directory; it is then copied
+ * into the dump's `local/` so the dump layout is the same either way.
+ */
+async function copyConversationArtifacts(
+	sourceSessionFile: string,
+	sourceSessionId: string | undefined,
+	targetDumpFile: string,
+): Promise<void> {
+	const sourceArtifactsDir = dumpArtifactsDir(sourceSessionFile);
+	const targetArtifactsDir = dumpArtifactsDir(targetDumpFile);
+	await copyDirectoryIfPresent(sourceArtifactsDir, targetArtifactsDir);
+	const localRoot = resolveLocalRoot({
+		getArtifactsDir: () => sourceArtifactsDir,
+		getSessionId: () => sourceSessionId ?? null,
+	});
+	// Across Windows drives `path.relative` returns an absolute path rather than one starting with `..`.
+	const relativeLocalRoot = path.relative(sourceArtifactsDir, localRoot);
+	if (relativeLocalRoot.startsWith("..") || path.isAbsolute(relativeLocalRoot)) {
+		await copyDirectoryIfPresent(localRoot, path.join(targetArtifactsDir, "local"));
 	}
 }
 
@@ -162,7 +189,7 @@ export async function writeConversationDump(params: {
 	});
 	await Bun.write(dumpPath, `${body}\n`);
 	if (params.snapshot.sourceSessionFile) {
-		await copyConversationArtifacts(params.snapshot.sourceSessionFile, dumpPath);
+		await copyConversationArtifacts(params.snapshot.sourceSessionFile, params.snapshot.sourceSessionId, dumpPath);
 	}
 	return dumpPath;
 }
@@ -172,6 +199,7 @@ async function snapshotConversationDump(client: BenchmarkClient): Promise<Conver
 	return {
 		messages,
 		sourceSessionFile: state.sessionFile,
+		sourceSessionId: state.sessionId,
 		systemPrompt: state.systemPrompt,
 		model: state.model,
 		thinkingLevel: state.thinkingLevel,
